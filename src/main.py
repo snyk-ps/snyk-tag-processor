@@ -9,6 +9,7 @@ from yarl import URL
 import aiohttp
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.queue.aio import QueueClient
+from azure.storage.queue import QueueMessage
 
 # Configuration - Required
 SNYK_TOKEN = os.environ.get("SNYK_TOKEN")
@@ -191,7 +192,7 @@ class SnykApiClient:
 
 
 async def process_message(
-    message, queue_client: QueueClient, api_client: SnykApiClient
+    message: QueueMessage, queue_client: QueueClient, api_client: SnykApiClient
 ) -> None:
     """
     Processes a message from the queue.
@@ -261,7 +262,9 @@ async def process_message(
         )
 
 
-async def requeue_message(message, queue_client: QueueClient, attempts: int) -> None:
+async def requeue_message(
+    message: QueueMessage, queue_client: QueueClient, attempts: int
+) -> None:
     """
     Requeues a message with incremented attempts and logarithmic timeout.
 
