@@ -22,6 +22,9 @@ SNYK_REST_API_VERSION = os.environ.get("SNYK_REST_API_VERSION", "2024-10-15")
 SNYK_V1_API_URL = os.environ.get("SNYK_V1_API_URL", "https://api.snyk.io/v1/")
 BASE_TIMEOUT_MINUTES = int(os.environ.get("BASE_TIMEOUT_MINUTES", 30))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", 5))
+QUEUE_POLLING_INTERVAL_SECONDS = float(
+    os.environ.get("QUEUE_POLLING_INTERVAL_SECONDS", 10)
+)
 
 # Logging setup
 logging.getLogger("azure").setLevel(logging.WARNING)
@@ -336,7 +339,7 @@ async def main() -> None:
 
             if tasks:
                 await asyncio.gather(*tasks)
-            await asyncio.sleep(1)  # Polling interval
+            await asyncio.sleep(QUEUE_POLLING_INTERVAL_SECONDS)
     finally:
         await snyk_api_client.close_session()
 
