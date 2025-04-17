@@ -9,6 +9,7 @@ from yarl import URL
 import aiohttp
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.queue.aio import QueueClient
+from azure.storage.queue import QueueMessage
 
 # Configuration
 SNYK_TOKEN = os.environ.get("SNYK_TOKEN")
@@ -37,9 +38,15 @@ async def get_queue_client() -> QueueClient:
     return QueueClient(queue_url, queue_name, credential=credential)
 
 
-async def get_import_job_status(import_job_url):
+async def get_import_job_status(import_job_url: str) -> Optional[str]:
     """
     Retrieves the import status of a Snyk import job.
+
+    Args:
+        import_job_url: The URL of the Snyk import job.
+
+    Returns:
+        The status of the import job, or None if an error occurred.
     """
     async with aiohttp.ClientSession() as session:
         try:
@@ -58,7 +65,17 @@ async def get_import_job_status(import_job_url):
 async def retrieve_project_ids(
     target_name: str, branch: str, org_id: str
 ) -> Optional[List[str]]:
-    """Retrieves project IDs from Snyk API for a given target name."""
+    """
+    Retrieves project IDs from Snyk API for a given target name.
+
+    Args:
+        target_name: The name of the target repository.
+        branch: The branch of the target repository.
+        org_id: The Snyk organization ID.
+
+    Returns:
+        A list of project IDs, or None if an error occurred.
+    """
     url = f"{SNYK_REST_API_URL}orgs/{org_id}/projects"
     params = {
         "version": SNYK_REST_API_VERSION,
@@ -90,7 +107,17 @@ async def retrieve_project_ids(
 async def tag_projects(
     project_ids: List[str], tags: List[Dict[str, str]], org_id: str
 ) -> bool:
-    """Tags projects in Snyk with the given tags."""
+    """
+    Tags projects in Snyk with the given tags.
+
+    Args:
+        project_ids: A list of project IDs to tag.
+        tags: A list of tags to apply to the projects.
+        org_id: The Snyk organization ID.
+
+    Returns:
+        True if all tags were applied successfully, False otherwise.
+    """
     url = f"{SNYK_V1_API_URL}org/{org_id}/project/{{project_id}}/tags"
     headers = {
         "Content-Type": "application/json",
@@ -125,8 +152,14 @@ async def tag_projects(
         return True
 
 
-async def process_message(message, queue_client: QueueClient) -> None:
-    """Processes a message from the queue."""
+async def process_message(message: QueueMessage, queue_client: QueueClient) -> None:
+    """
+    Processes a message from the queue.
+
+    Args:
+        message: The message from the Azure Storage Queue.
+        queue_client: The Azure Storage Queue client.
+    """
     try:
         content = json.loads(message.content)
         target_name = content["target_name"]
@@ -181,8 +214,17 @@ async def process_message(message, queue_client: QueueClient) -> None:
         )
 
 
-async def requeue_message(message, queue_client: QueueClient, attempts: int) -> None:
-    """Requeues a message with incremented attempts and logarithmic timeout."""
+async def requeue_message(
+    message: QueueMessage, queue_client: QueueClient, attempts: int
+) -> None:
+    """
+    Requeues a message with incremented attempts and logarithmic timeout.
+
+    Args:
+        message: The message to requeue.
+        queue_client: The Azure Storage Queue client.
+        attempts: The current number of attempts.
+    """
     attempts += 1
     content = json.loads(message.content)
     content["attempts"] = attempts
