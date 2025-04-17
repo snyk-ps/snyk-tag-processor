@@ -9,16 +9,16 @@ from yarl import URL
 import aiohttp
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.queue.aio import QueueClient
-from azure.storage.queue import QueueMessage
 
-# Configuration
+# Configuration - Required
 SNYK_TOKEN = os.environ.get("SNYK_TOKEN")
+STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME")
+STORAGE_QUEUE_NAME = os.environ.get("STORAGE_QUEUE_NAME")
+
+# Configuration - Optional
 SNYK_REST_API_URL = os.environ.get("SNYK_REST_API_URL", "https://api.snyk.io/rest/")
 SNYK_REST_API_VERSION = os.environ.get("SNYK_REST_API_VERSION", "2024-10-15")
 SNYK_V1_API_URL = os.environ.get("SNYK_V1_API_URL", "https://api.snyk.io/v1/")
-
-STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME")
-STORAGE_QUEUE_NAME = os.environ.get("STORAGE_QUEUE_NAME")
 BASE_TIMEOUT_MINUTES = int(os.environ.get("BASE_TIMEOUT_MINUTES", 30))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", 5))
 
@@ -38,127 +38,148 @@ async def get_queue_client() -> QueueClient:
     return QueueClient(queue_url, queue_name, credential=credential)
 
 
-async def get_import_job_status(import_job_url: str) -> Optional[str]:
-    """
-    Retrieves the import status of a Snyk import job.
+class SnykApiClient:
+    def __init__(self, snyk_token: str):
+        self.token = snyk_token
+        self.rest_api_url = SNYK_REST_API_URL
+        self.rest_api_version = SNYK_REST_API_VERSION
+        self.v1_api_url = SNYK_V1_API_URL
+        self._session = None
 
-    Args:
-        import_job_url: The URL of the Snyk import job.
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={"Authorization": f"token {self.token}"}
+            )
+        return self._session
 
-    Returns:
-        The status of the import job, or None if an error occurred.
-    """
-    async with aiohttp.ClientSession() as session:
+    async def close_session(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def _get(self, url: str, params: Optional[Dict[str, str]] = None):
+        session = await self._get_session()
         try:
-            headers = {
-                "Authorization": f"token {SNYK_TOKEN}",
-            }
-            async with session.get(import_job_url, headers=headers) as response:
+            full_url = url
+            if params:
+                full_url = f"{url}?{params}"
+            async with session.get(URL(full_url, encoded=True)) as response:
                 response.raise_for_status()
-                data = await response.json()
-                return data.get("status")
+                return await response.json()
         except aiohttp.ClientError as e:
-            logger.error(f"Error fetching import job status: {e}")
+            logger.error(f"HTTP GET error for {url}: {e}")
             return None
 
-
-async def retrieve_project_ids(
-    target_name: str, branch: str, org_id: str
-) -> Optional[List[str]]:
-    """
-    Retrieves project IDs from Snyk API for a given target name.
-
-    Args:
-        target_name: The name of the target repository.
-        branch: The branch of the target repository.
-        org_id: The Snyk organization ID.
-
-    Returns:
-        A list of project IDs, or None if an error occurred.
-    """
-    url = f"{SNYK_REST_API_URL}orgs/{org_id}/projects"
-    params = {
-        "version": SNYK_REST_API_VERSION,
-        "names_start_with": target_name,
-        "target_reference": branch,
-        "origins": "azure-repos",
-        "limit": 100,
-    }
-    headers = {
-        "Authorization": f"token {SNYK_TOKEN}",
-    }
-    full_url = f"{url}?{urlencode(params, safe="")}"
-
-    async with aiohttp.ClientSession() as session:
+    async def _post(self, url: str, json_data: Optional[Dict] = None):
+        session = await self._get_session()
+        headers = {"Content-Type": "application/json"}
         try:
-            async with session.get(
-                URL(full_url, encoded=True), headers=headers
-            ) as response:
+            async with session.post(url, headers=headers, json=json_data) as response:
+                if response.status == 422 and "tags" in url:
+                    logger.debug(
+                        f"Received 422 for tagging URL {url}. Project already tagged."
+                    )
+                    return response
                 response.raise_for_status()
-                response_json = await response.json()
-                data = response_json.get("data")
-                project_ids = [item["id"] for item in data if item["type"] == "project"]
-                return project_ids
+                return response
         except aiohttp.ClientError as e:
-            logger.error(f"Failed to retrieve project IDs: {e}")
+            logger.error(f"HTTP POST error for {url}: {e}")
             return None
 
+    async def get_import_job_status(self, import_job_url: str) -> Optional[str]:
+        """
+        Retrieves the import status of a Snyk import job.
 
-async def tag_projects(
-    project_ids: List[str], tags: List[Dict[str, str]], org_id: str
-) -> bool:
-    """
-    Tags projects in Snyk with the given tags.
+        Args:
+            import_job_url: The URL of the Snyk import job.
 
-    Args:
-        project_ids: A list of project IDs to tag.
-        tags: A list of tags to apply to the projects.
-        org_id: The Snyk organization ID.
+        Returns:
+            The status of the import job, or None if an error occurred.
+        """
+        data = await self._get(import_job_url)
+        if data:
+            return data.get("status")
+        return None
 
-    Returns:
-        True if all tags were applied successfully, False otherwise.
-    """
-    url = f"{SNYK_V1_API_URL}org/{org_id}/project/{{project_id}}/tags"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"token {SNYK_TOKEN}",
-    }
-    async with aiohttp.ClientSession() as session:
+    async def retrieve_project_ids(
+        self, target_name: str, branch: str, org_id: str
+    ) -> Optional[List[str]]:
+        """
+        Retrieves project IDs from Snyk API for a given target name.
+
+        Args:
+            target_name: The name (prefix) of the target.
+            branch: The branch name of the target.
+            org_id: The Snyk organization ID.
+
+        Returns:
+            A list of project IDs, or None if an error occurred.
+        """
+        url = f"{self.rest_api_url}orgs/{org_id}/projects"
+        params = {
+            "version": self.rest_api_version,
+            "names_start_with": target_name,
+            "target_reference": branch,
+            "origins": "azure-repos",
+            "limit": 100,
+        }
+        response_json = await self._get(url, params=urlencode(params, safe=""))
+        if response_json and "data" in response_json:
+            data = response_json["data"]
+            project_ids = [item["id"] for item in data if item["type"] == "project"]
+            return project_ids
+        return None
+
+    async def tag_projects(
+        self, project_ids: List[str], tags: List[Dict[str, str]], org_id: str
+    ) -> bool:
+        """
+        Tags projects in Snyk with the given tags.
+
+        Args:
+            project_ids: A list of Snyk project IDs to tag.
+            tags: A list of dictionaries, where each dictionary represents a tag with 'key' and 'value'.
+            org_id: The Snyk organization ID.
+
+        Returns:
+            True if all tagging attempts were made (successful or already tagged), False otherwise.
+        """
+        url = f"{self.v1_api_url}org/{org_id}/project/{{project_id}}/tags"
         for project_id in project_ids:
             full_url = url.format(project_id=project_id)
             for tag in tags:
-                try:
-                    async with session.post(
-                        full_url,
-                        headers=headers,
-                        json=tag,
-                    ) as response:
-                        if response.status == 200:
-                            logger.info(
-                                f"Successfully tagged project {project_id} with {tag}"
-                            )
-                        elif response.status == 422:
-                            logger.info(
-                                f"Project {project_id} already tagged with {tag}."
-                            )
-                        else:
-                            response.raise_for_status()
-                except aiohttp.ClientError as e:
-                    logger.error(f"Failed to tag project {project_id}: {e}")
-                except Exception as e:
-                    logger.exception(
-                        f"An unexpected error occured while tagging project {project_id} with {tag}: {e}"
+                response = await self._post(full_url, json_data=tag)
+                if response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully tagged project {project_id} with {tag}"
+                        )
+                    elif response.status == 422:
+                        logger.info(f"Project: {project_id} already tagged with {tag}.")
+                    else:
+                        logger.error(
+                            f"Failed to tag project {project_id} with {tag}. Status: {response.status}"
+                        )
+                else:
+                    logger.error(
+                        f"Failed to tag project {project_id} with {tag} due to network error."
                     )
         return True
 
 
-async def process_message(message: QueueMessage, queue_client: QueueClient) -> None:
+async def process_message(
+    message, queue_client: QueueClient, api_client: SnykApiClient
+) -> None:
     """
     Processes a message from the queue.
 
     Args:
-        message: The message from the Azure Storage Queue.
-        queue_client: The Azure Storage Queue client.
+        message: The message object received from the Azure Storage Queue.
+        queue_client: The Azure Storage Queue client instance.
+        api_client: An instance of the SnykApiClient.
+
+    Returns:
+        None
     """
     try:
         content = json.loads(message.content)
@@ -178,25 +199,28 @@ async def process_message(message: QueueMessage, queue_client: QueueClient) -> N
             await queue_client.delete_message(message)
             return
 
-        import_status = await get_import_job_status(import_job_url)
+        import_status = await api_client.get_import_job_status(import_job_url)
         if import_status == "complete":
             logger.info(
                 f"Import complete for target: {target_name}({branch}). Retrieving project IDs..."
             )
-            project_ids = await retrieve_project_ids(target_name, branch, org_id)
+            project_ids = await api_client.retrieve_project_ids(
+                target_name, branch, org_id
+            )
+            logger.info(f"Project IDs retrieved for target: {target_name}({branch}).")
             if project_ids:
-                if await tag_projects(project_ids, tags, org_id):
+                if await api_client.tag_projects(project_ids, tags, org_id):
                     await queue_client.delete_message(message)
                     logger.info(f"Message {message.id} processed successfully.")
             else:
                 await queue_client.delete_message(message)
                 logger.info(
-                    f"No project IDs found for target: {target_name}({branch}), deleted {message.id}."
+                    f"No project IDs found for target: {target_name}({branch}), deleted message: {message.id}."
                 )
         elif import_status == "pending":
             await requeue_message(message, queue_client, attempts)
             logger.info(
-                f"Import staus pending for target: {target_name}({branch}), requeued message {message.id}"
+                f"Import status pending for target: {target_name}({branch}), requeued message {message.id}"
             )
         else:
             await queue_client.delete_message(message)
@@ -214,16 +238,17 @@ async def process_message(message: QueueMessage, queue_client: QueueClient) -> N
         )
 
 
-async def requeue_message(
-    message: QueueMessage, queue_client: QueueClient, attempts: int
-) -> None:
+async def requeue_message(message, queue_client: QueueClient, attempts: int) -> None:
     """
     Requeues a message with incremented attempts and logarithmic timeout.
 
     Args:
-        message: The message to requeue.
-        queue_client: The Azure Storage Queue client.
-        attempts: The current number of attempts.
+        message: The message object to requeue.
+        queue_client: The Azure Storage Queue client instance.
+        attempts: The current number of attempts for this message.
+
+    Returns:
+        None
     """
     attempts += 1
     content = json.loads(message.content)
@@ -243,19 +268,25 @@ async def requeue_message(
 
 async def main() -> None:
     """Main function to run the message processing loop."""
+    snyk_api_client = SnykApiClient(SNYK_TOKEN)
     queue_client = await get_queue_client()
-    while True:
-        messages = queue_client.receive_messages(
-            messages_per_page=32, visibility_timeout=30
-        )
-        tasks = []
-        async for message in messages:
-            task = asyncio.create_task(process_message(message, queue_client))
-            tasks.append(task)
+    try:
+        while True:
+            messages = queue_client.receive_messages(
+                messages_per_page=32, visibility_timeout=30
+            )
+            tasks = []
+            async for message in messages:
+                task = asyncio.create_task(
+                    process_message(message, queue_client, snyk_api_client)
+                )
+                tasks.append(task)
 
-        if tasks:
-            await asyncio.gather(*tasks)
-        await asyncio.sleep(1)  # Polling interval
+            if tasks:
+                await asyncio.gather(*tasks)
+            await asyncio.sleep(1)  # Polling interval
+    finally:
+        await snyk_api_client.close_session()
 
 
 if __name__ == "__main__":
