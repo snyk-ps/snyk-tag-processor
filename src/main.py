@@ -154,6 +154,40 @@ class SnykApiClient:
             return project_ids
         return None
 
+    async def _tag_project(
+        self, project_id: str, tag: Dict[str, str], org_id: str
+    ) -> bool:
+        """
+        Tags a single project in Snyk with the given tag.
+
+        Args:
+            project_id: A Snyk project ID to tag.
+            tags: A dictionary which represents a tag with 'key' and 'value'.
+            org_id: The Snyk organization ID.
+
+        Returns:
+            True if project was tagged successfully (including already tagged), False if any tagging failed due to other errors.
+        """
+        url = f"{self.v1_api_url}org/{org_id}/project/{project_id}/tags"
+        response = await self._post(url, json_data=tag)
+        if response:
+            if response.status == 200:
+                logger.info(f"Successfully tagged project {project_id} with {tag}")
+                return True
+            elif response.status == 422:
+                logger.info(f"Project {project_id} already tagged with {tag}.")
+                return True
+            else:
+                logger.error(
+                    f"Failed to tag project {project_id} with {tag}. Status: {response.status}"
+                )
+                return False
+        else:
+            logger.error(
+                f"Failed to tag project {project_id} with {tag} due to network error."
+            )
+            return False
+
     async def tag_projects(
         self, project_ids: List[str], tags: List[Dict[str, str]], org_id: str
     ) -> bool:
@@ -166,28 +200,12 @@ class SnykApiClient:
             org_id: The Snyk organization ID.
 
         Returns:
-            True if all tagging attempts were made (successful or already tagged), False otherwise.
+            True if all tagging attempts for all projects were successful (including already tagged), False if any tagging failed due to other errors.
         """
-        url = f"{self.v1_api_url}org/{org_id}/project/{{project_id}}/tags"
         for project_id in project_ids:
-            full_url = url.format(project_id=project_id)
             for tag in tags:
-                response = await self._post(full_url, json_data=tag)
-                if response:
-                    if response.status == 200:
-                        logger.info(
-                            f"Successfully tagged project {project_id} with {tag}"
-                        )
-                    elif response.status == 422:
-                        logger.info(f"Project: {project_id} already tagged with {tag}.")
-                    else:
-                        logger.error(
-                            f"Failed to tag project {project_id} with {tag}. Status: {response.status}"
-                        )
-                else:
-                    logger.error(
-                        f"Failed to tag project {project_id} with {tag} due to network error."
-                    )
+                if not await self._tag_project(project_id, tag, org_id):
+                    return False
         return True
 
 
@@ -236,6 +254,11 @@ async def process_message(
                 if await api_client.tag_projects(project_ids, tags, org_id):
                     await queue_client.delete_message(message)
                     logger.info(f"Message {message.id} processed successfully.")
+                else:
+                    logger.error(
+                        f"Failed to tag one or more projects for message {message.id}."
+                    )
+                    await requeue_message(message, queue_client, attempts)
             else:
                 await queue_client.delete_message(message)
                 logger.info(
