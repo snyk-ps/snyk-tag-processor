@@ -30,6 +30,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def check_vars() -> bool:
+    """
+    Checks if required environment variables are present.
+
+    Returns:
+        True if all require environment variables present, False otherwise
+    """
+    required = ["SNYK_TOKEN", "STORAGE_ACCOUNT_NAME", "STORAGE_QUEUE_NAME"]
+    missing = []
+
+    for var in required:
+        if not os.environ.get(var):
+            missing.append(var)
+
+    if missing:
+        logger = logging.getLogger(__name__)
+        logger.error(
+            f"The following required environment variables are not set: {', '.join(missing)}"
+        )
+        return False
+    return True
+
+
 async def get_queue_client() -> QueueClient:
     """Retrieves an Azure Storage Queue client with managed identity."""
     credential = DefaultAzureCredential()
@@ -268,6 +291,9 @@ async def requeue_message(message, queue_client: QueueClient, attempts: int) -> 
 
 async def main() -> None:
     """Main function to run the message processing loop."""
+    if not check_vars():
+        return
+
     snyk_api_client = SnykApiClient(SNYK_TOKEN)
     queue_client = await get_queue_client()
     try:
