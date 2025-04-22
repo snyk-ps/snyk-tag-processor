@@ -160,8 +160,6 @@ After installation, you can verify that the application is set up correctly by:
 
 The Snyk Tag Processor automates the process of applying tags to your Snyk projects after they are imported from Azure Repos. This allows you to organize and categorize your Snyk projects based on your specific needs, such as application ID, team ownership, or environment.
 
-To use the Snyk Project Tagger, you need to populate the configured Azure Storage Queue with messages in a specific JSON format. Each message should contain the necessary information for the application to identify the imported projects and apply the correct tags.
-
 ### Message Format
 
 To use the Snyk Tag Processor, your Azure Storage Queue needs to be populated with messages in the following JSON format:
