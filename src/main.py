@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 import os
 from typing import Dict, List, Optional
 from urllib.parse import urlencode
@@ -20,11 +21,12 @@ STORAGE_QUEUE_NAME = os.environ.get("STORAGE_QUEUE_NAME")
 SNYK_REST_API_URL = os.environ.get("SNYK_REST_API_URL", "https://api.snyk.io/rest/")
 SNYK_REST_API_VERSION = os.environ.get("SNYK_REST_API_VERSION", "2024-10-15")
 SNYK_V1_API_URL = os.environ.get("SNYK_V1_API_URL", "https://api.snyk.io/v1/")
-BASE_TIMEOUT_MINUTES = int(os.environ.get("BASE_TIMEOUT_MINUTES", 30))
+MAX_TIMEOUT_MINUTES = int(os.environ.get("MAX_TIMEOUT_MINUTES", 30))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", 5))
 QUEUE_POLLING_INTERVAL_SECONDS = float(
     os.environ.get("QUEUE_POLLING_INTERVAL_SECONDS", 10)
 )
+VISIBILITY_TIMEOUT_SECONDS = int(os.environ.get("VISIBILITY_TIMEOUT_SECONDS", 30))
 
 # Logging setup
 logging.getLogger("azure").setLevel(logging.WARNING)
@@ -205,11 +207,34 @@ class SnykApiClient:
         Returns:
             True if all tagging attempts for all projects were successful (including already tagged), False if any tagging failed due to other errors.
         """
+        all_successful = True
         for project_id in project_ids:
             for tag in tags:
                 if not await self._tag_project(project_id, tag, org_id):
-                    return False
-        return True
+                    logger.error(f"Failed to tag project {project_id} with {tag}.")
+                    all_successful = False
+        return all_successful
+
+
+async def renew_lease(queue_client: QueueClient, message: QueueMessage):
+    """
+    Periodically renews the visibility timeout of a message.
+
+    Args:
+        message: The message object received from the Azure Storage Queue.
+        queue_client: The Azure Storage Queue client instance.
+    """
+    while True:
+        await asyncio.sleep(VISIBILITY_TIMEOUT_SECONDS // 2)
+        try:
+            await queue_client.update_message(
+                message,
+                visibility_timeout=VISIBILITY_TIMEOUT_SECONDS,  # Reset to the initial visibility timeout
+            )
+            logger.info(f"Renewed lease for message: {message.id}")
+        except Exception as e:
+            logger.error(f"Error renewing lease for message {message.id}: {e}")
+            break
 
 
 async def process_message(
@@ -226,7 +251,10 @@ async def process_message(
     Returns:
         None
     """
+    renewal_task = None
     try:
+        renewal_task = asyncio.create_task(renew_lease(queue_client, message))
+
         content = json.loads(message.content)
         target_name = content["target_name"]
         branch = content["branch"]
@@ -273,9 +301,9 @@ async def process_message(
                 f"Import status pending for target: {target_name}({branch}), requeued message {message.id}"
             )
         else:
-            await queue_client.delete_message(message)
+            await requeue_message(message, queue_client, attempts)
             logger.error(
-                f"Import failed for target: {target_name}({branch}), deleted message {message.id}"
+                f"Import status failed for target: {target_name}({branch}), requeued message {message.id}"
             )
 
     except (json.JSONDecodeError, KeyError) as e:
@@ -286,13 +314,20 @@ async def process_message(
         logger.error(
             f"An unexpected error occurred: {e}, requeued message {message.id}"
         )
+    finally:
+        if renewal_task:
+            renewal_task.cancel()
+            try:
+                await renewal_task
+            except asyncio.CancelledError:
+                logger.debug(f"Lease renewal task cancelled for message: {message.id}")
 
 
 async def requeue_message(
     message: QueueMessage, queue_client: QueueClient, attempts: int
 ) -> None:
     """
-    Requeues a message with incremented attempts and logarithmic timeout.
+    Requeues a message with incremented attempts and increases timeout with each attempt.
 
     Args:
         message: The message object to requeue.
@@ -306,8 +341,7 @@ async def requeue_message(
     content = json.loads(message.content)
     content["attempts"] = attempts
 
-    # Calculate logarithmic timeout
-    timeout_minutes = BASE_TIMEOUT_MINUTES * (0.5 ** (MAX_ATTEMPTS - attempts))
+    timeout_minutes = MAX_TIMEOUT_MINUTES * (0.5 ** (MAX_ATTEMPTS - attempts))
     timeout_seconds = int(timeout_minutes * 60)
 
     await queue_client.update_message(
@@ -328,7 +362,7 @@ async def main() -> None:
     try:
         while True:
             messages = queue_client.receive_messages(
-                messages_per_page=32, visibility_timeout=30
+                messages_per_page=32, visibility_timeout=VISIBILITY_TIMEOUT_SECONDS
             )
             tasks = []
             async for message in messages:
