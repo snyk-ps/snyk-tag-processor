@@ -1,16 +1,22 @@
 import asyncio
 import json
 import logging
-import time
 import os
+from aiohttp import ClientSession, ClientError, ClientResponseError
 from typing import Dict, List, Optional
 from urllib.parse import urlencode
 from yarl import URL
 
-import aiohttp
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.queue.aio import QueueClient
 from azure.storage.queue import QueueMessage
+
+
+class ProjectRetrievalError(Exception):
+    """Custom exception for errors during project ID retrieval."""
+
+    pass
+
 
 # Configuration - Required
 SNYK_TOKEN = os.environ.get("SNYK_TOKEN")
@@ -75,9 +81,9 @@ class SnykApiClient:
         self.v1_api_url = SNYK_V1_API_URL
         self._session = None
 
-    async def _get_session(self) -> aiohttp.ClientSession:
+    async def _get_session(self) -> ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
+            self._session = ClientSession(
                 headers={"Authorization": f"token {self.token}"}
             )
         return self._session
@@ -95,9 +101,17 @@ class SnykApiClient:
             async with session.get(URL(full_url, encoded=True)) as response:
                 response.raise_for_status()
                 return await response.json()
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP GET error for {url}: {e}")
-            return None
+        except ClientResponseError as e:
+            logger.error(f"HTTP GET error for {url} (status {e.status}): {e}")
+            raise e  # Re-raise the specific HTTP error
+        except ClientError as e:
+            logger.error(f"Client error during GET request to {url}: {e}")
+            raise e  # Re-raise other client-related errors
+        except Exception as e:
+            logger.error(
+                f"An unexpected error occurred during the GET request to {url}: {e}"
+            )
+            raise
 
     async def _post(self, url: str, json_data: Optional[Dict] = None):
         session = await self._get_session()
@@ -111,7 +125,7 @@ class SnykApiClient:
                     return response
                 response.raise_for_status()
                 return response
-        except aiohttp.ClientError as e:
+        except ClientError as e:
             logger.error(f"HTTP POST error for {url}: {e}")
             return None
 
@@ -134,7 +148,7 @@ class SnykApiClient:
         self, target_name: str, branch: str, org_id: str
     ) -> Optional[List[str]]:
         """
-        Retrieves project IDs from Snyk API for a given target name.
+        Retrieves project IDs from Snyk API for a given target name, handling pagination.
 
         Args:
             target_name: The name (prefix) of the target.
@@ -142,22 +156,47 @@ class SnykApiClient:
             org_id: The Snyk organization ID.
 
         Returns:
-            A list of project IDs, or None if an error occurred.
+            A list of all matching project IDs, or None if an error occurred.
+
+        Raises:
+            ProjectRetrievalError: If an error occurs during the API request.
         """
+        all_project_ids = []
         url = f"{self.rest_api_url}orgs/{org_id}/projects"
         params = {
             "version": self.rest_api_version,
             "names_start_with": target_name,
             "target_reference": branch,
             "origins": "azure-repos",
-            "limit": 100,
+            "limit": 10,
         }
-        response_json = await self._get(url, params=urlencode(params, safe=""))
-        if response_json and "data" in response_json:
-            data = response_json["data"]
-            project_ids = [item["id"] for item in data if item["type"] == "project"]
-            return project_ids
-        return None
+
+        while url:
+            try:
+                response_json = await self._get(url, params=urlencode(params, safe=""))
+                if response_json:
+                    data = response_json.get("data")
+                    project_ids = [
+                        item["id"] for item in data if item.get("type") == "project"
+                    ]
+                    all_project_ids.extend(project_ids)
+                    next_page = response_json.get("links").get("next")
+                    if next_page:
+                        url = f"{"https://api.snyk.io"}{next_page}"
+                        params = {}
+                    else:
+                        url = None
+                else:
+                    raise ProjectRetrievalError(
+                        f"Empty response received while retrieving project IDs for {target_name}/{branch}"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"An unexpected error occurred while retrieving project IDs for {target_name}/{branch}: {e}"
+                )
+                raise Exception(e)
+
+        return all_project_ids
 
     async def _tag_project(
         self, project_id: str, tag: Dict[str, str], org_id: str
@@ -277,43 +316,51 @@ async def process_message(
             logger.info(
                 f"Import complete for target: {target_name}({branch}). Retrieving project IDs..."
             )
-            project_ids = await api_client.retrieve_project_ids(
-                target_name, branch, org_id
-            )
-            logger.info(f"Project IDs retrieved for target: {target_name}({branch}).")
-            if project_ids:
-                if await api_client.tag_projects(project_ids, tags, org_id):
-                    await queue_client.delete_message(message)
-                    logger.info(f"Message {message.id} processed successfully.")
-                else:
-                    logger.error(
-                        f"Failed to tag one or more projects for message {message.id}."
-                    )
-                    await requeue_message(message, queue_client, attempts)
-            else:
-                await queue_client.delete_message(message)
-                logger.info(
-                    f"No project IDs found for target: {target_name}({branch}), deleted message: {message.id}."
+            try:
+                project_ids = await api_client.retrieve_project_ids(
+                    target_name, branch, org_id
                 )
+                logger.info(
+                    f"Project IDs retrieved for target: {target_name}({branch})."
+                )
+                if project_ids:
+                    if await api_client.tag_projects(project_ids, tags, org_id):
+                        await queue_client.delete_message(message)
+                        logger.info(f"Message {message.id} processed successfully.")
+                    else:
+                        logger.error(
+                            f"Failed to tag one or more projects for {target_name}/{branch}, requeueing message: {message.id}"
+                        )
+                        await requeue_message(message, queue_client, attempts)
+                else:
+                    await queue_client.delete_message(message)
+                    logger.info(
+                        f"No project IDs found for target: {target_name}({branch}), deleted message: {message.id}."
+                    )
+            except Exception as e:
+                logger.error(
+                    f"An unexpected error occurred: {e}, requeueing message {message.id}"
+                )
+                await requeue_message(message, queue_client, attempts)
         elif import_status == "pending":
-            await requeue_message(message, queue_client, attempts)
             logger.info(
-                f"Import status pending for target: {target_name}({branch}), requeued message {message.id}"
+                f"Import status pending for target: {target_name}({branch}), requeueing message {message.id}"
             )
-        else:
             await requeue_message(message, queue_client, attempts)
+        else:
             logger.error(
-                f"Import status failed for target: {target_name}({branch}), requeued message {message.id}"
+                f"Import status failed for target: {target_name}({branch}), requeueing message {message.id}"
             )
+            await requeue_message(message, queue_client, attempts)
 
     except (json.JSONDecodeError, KeyError) as e:
         await queue_client.delete_message(message)
         logger.error(f"Invalid message format: {e}, deleted message {message.id}")
     except Exception as e:
-        await requeue_message(message, queue_client, attempts)
         logger.error(
-            f"An unexpected error occurred: {e}, requeued message {message.id}"
+            f"An unexpected error occurred: {e}, requeueing message {message.id}"
         )
+        await requeue_message(message, queue_client, attempts)
     finally:
         if renewal_task:
             renewal_task.cancel()
