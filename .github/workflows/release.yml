@@ -3,7 +3,7 @@ name: Docker Release
 on:
   push:
     tags:
-      - 'v*.*.*' # Trigger on any tag matching the pattern vX.Y.Z
+      - "v*.*.*" # Trigger on any tag matching the pattern vX.Y.Z
 
 jobs:
   build_and_publish:
@@ -40,7 +40,7 @@ jobs:
           file: Dockerfile
 
       - name: Create GitHub Release
-        uses: actions/create-release@v2 
+        uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
