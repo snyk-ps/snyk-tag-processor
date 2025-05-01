@@ -168,7 +168,7 @@ class SnykApiClient:
             "names_start_with": target_name,
             "target_reference": branch,
             "origins": "azure-repos",
-            "limit": 10,
+            "limit": 100,
         }
 
         while url:
