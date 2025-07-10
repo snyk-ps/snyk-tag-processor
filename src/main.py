@@ -4,7 +4,7 @@ import logging
 import os
 from aiohttp import ClientSession, ClientError, ClientResponseError
 from typing import Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from yarl import URL
 
 from azure.identity.aio import DefaultAzureCredential
@@ -173,7 +173,9 @@ class SnykApiClient:
 
         while url:
             try:
-                response_json = await self._get(url, params=urlencode(params, safe=""))
+                response_json = await self._get(
+                    url, params=urlencode(params, safe="", quote_via=quote)
+                )
                 if response_json:
                     data = response_json.get("data")
                     project_ids = [
